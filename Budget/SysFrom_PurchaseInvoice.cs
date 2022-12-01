@@ -37,7 +37,6 @@ namespace FT_ADDON.Budget
         {
             SAPbobsCOM.Recordset rs = (SAPbobsCOM.Recordset)SAP.SBOCompany.GetBusinessObject(SAPbobsCOM.BoObjectTypes.BoRecordset);
             SQLQuery.FillFromSAPSQL(oForm, $"{nameof(SysFrom_PurchaseInvoice)}.checkbudget", out rs);
-
             if (rs.RecordCount > 0)
             {
                 if (rs.Fields.Item(0).Value.ToString() != "0")
