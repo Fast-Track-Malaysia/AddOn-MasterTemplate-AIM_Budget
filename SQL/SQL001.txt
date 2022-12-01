@@ -1,0 +1,411 @@
+insert into [@SQLQUERY]
+([Code], [Name], U_Query)
+values
+('SysFrom_PurchaseInvoice.checkbudget', 'checkbudget', 'exec ftsp_checkbudget $[OPCH.DocEntry]')
+go
+
+
+
+create procedure [dbo].[ftsp_checkbudget]
+@list_of_cols_val_tab_del int
+as
+begin
+	declare @error  int				-- Result (0 for no error)
+	declare @error_message nvarchar (200) 		-- Error string to be displayed
+	select @error = 0
+	select @error_message = N'Ok'
+	-------------------------------------
+	declare @POYear int
+	declare @CountOverBudgetWL int
+	declare @CountOverBudgetCW int
+	declare @CountOverBudgetBG int
+	declare @CountOverBudgetJB int
+	declare @CountOverBudgetUN int
+	declare @POApproval nvarchar(10)
+
+	select @error_message = 'Over budget for '
+
+	SELECT @POYear = YEAR(T0.DocDate)	FROM OPCH T0 WHERE T0.DocEntry = @list_of_cols_val_tab_del;
+	SELECT @POApproval = T0.U_Approval	FROM OPCH T0 WHERE T0.DocEntry = @list_of_cols_val_tab_del;
+
+	--budget control by Wilayah
+	;with BudgetAmt as 
+	(
+	select T1.U_gc, T1.U_wc, T1.U_budgetAmt
+	FROM [@BUDGET_H] T0 inner join [@BUDGET_D] T1 On T0.Code = T1.Code and T0.U_Active = 'Y' and T0.U_bdgyear = @POYear
+	WHERE ISNULL(T1.U_wc,'') <> ''
+	),
+
+	YTDPOAmount as
+	(
+		SELECT M0.AcctCode, M0.PrcName, sum(M0.POAmt) as POAmt
+		FROM
+		(
+			--Previous PO
+			select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from OPOR T0 inner join POR1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'WL'
+			WHERE Year(T0.DocDate) = @POYear and T0.CANCELED = 'N' and T0.DocEntry <> @list_of_cols_val_tab_del
+			and T1.AcctCode in (select M0.AcctCode from por1 M0 where M0.DocEntry = @list_of_cols_val_tab_del)
+			AND T1.OcrCode in (select M1.OcrCode from por1 M1 where M1.DocEntry = @list_of_cols_val_tab_del)
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--Current PO
+			select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from OPOR T0 inner join POR1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'WL'
+			WHERE Year(T0.DocDate) = @POYear and T0.CANCELED = 'N' and T0.DocEntry = @list_of_cols_val_tab_del
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--Manual AP Invoice
+			select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from OPCH T0 inner join PCH1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'WL'
+			WHERE T0.U_ManualInv = 'Y' and Year(T0.DocDate) = @POYear and T0.CANCELED = 'N'
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--AP Credit Memo from Manual AP Invoice
+			select T1.AcctCode, T4.PrcName , -sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from ORPC T0 inner join RPC1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'WL'
+			WHERE T0.U_ManualInv = 'Y' and Year(T0.DocDate) = @POYear and T0.CANCELED = 'N'
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--Manual AP Credit Memo
+			select T1.AcctCode, T4.PrcName , -sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from ORPC T0 inner join RPC1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'WL'
+			WHERE T0.U_ManualCN = 'Y' and Year(T0.DocDate) = @POYear and T0.CANCELED = 'N'
+			group by T1.AcctCode, T4.PrcName
+		) M0
+		group by M0.AcctCode, M0.PrcName
+	)
+
+	select @CountOverBudgetWL = count(T0.AcctCode)
+	from YTDPOAmount T0 LEFT join BudgetAmt T1 ON T0.AcctCode = T1.U_gc and T0.PrcName = T1.U_wc
+	WHERE T0.POAmt > ISNULL(T1.U_budgetAmt,0) and ISNULL(T1.U_budgetAmt,0) > 0
+
+	if (@CountOverBudgetWL > 0 and @POApproval <> 'Y') 
+	begin
+		select @error = -1
+		select @error_message += 'Wilayah, '
+		goto EndValidationStep
+	end	
+
+	--budget control by Cawangan
+	;with CWBudgetAmt as 
+	(
+	select T1.U_gc, T1.U_cw, T1.U_budgetAmt
+	FROM [@BUDGET_H] T0 inner join [@BUDGET_D] T1 On T0.Code = T1.Code and T0.U_Active = 'Y' and T0.U_bdgyear = @POYear
+	WHERE ISNULL(T1.U_cw,'') <> ''
+	),
+
+	CWYTDPOAmount as
+	(
+		SELECT M0.AcctCode, M0.PrcName, sum(M0.POAmt) as POAmt
+		FROM
+		(
+			--Previous PO
+			select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from OPOR T0 inner join POR1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'CW'
+			WHERE Year(T0.DocDate) = @POYear and T0.CANCELED = 'N' and T0.DocEntry <> @list_of_cols_val_tab_del
+			and T1.AcctCode in (select M0.AcctCode from por1 M0 where M0.DocEntry = @list_of_cols_val_tab_del)
+			AND T1.OcrCode in (select M1.OcrCode from por1 M1 where M1.DocEntry = @list_of_cols_val_tab_del)
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--Current PO
+			select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from OPOR T0 inner join POR1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'CW'
+			WHERE Year(T0.DocDate) = @POYear and T0.CANCELED = 'N' and T0.DocEntry = @list_of_cols_val_tab_del
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--Manual AP Invoice
+			select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from OPCH T0 inner join PCH1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'CW'
+			WHERE T0.U_ManualInv = 'Y' and Year(T0.DocDate) = @POYear and T0.CANCELED = 'N'
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--AP Credit Memo from Manual AP Invoice
+			select T1.AcctCode, T4.PrcName , -sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from ORPC T0 inner join RPC1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'CW'
+			WHERE T0.U_ManualInv = 'Y' and Year(T0.DocDate) = @POYear and T0.CANCELED = 'N'
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--Manual AP Credit Memo
+			select T1.AcctCode, T4.PrcName , -sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from ORPC T0 inner join RPC1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'CW'
+			WHERE T0.U_ManualCN = 'Y' and Year(T0.DocDate) = @POYear and T0.CANCELED = 'N'
+			group by T1.AcctCode, T4.PrcName
+		) M0
+		group by M0.AcctCode, M0.PrcName
+	)
+
+	select @CountOverBudgetCW = count(T0.AcctCode)
+	from CWYTDPOAmount T0 LEFT join CWBudgetAmt T1 ON T0.AcctCode = T1.U_gc and T0.PrcName = T1.U_cw
+	WHERE T0.POAmt > ISNULL(T1.U_budgetAmt,0) and ISNULL(T1.U_budgetAmt,0) > 0
+
+	if (@CountOverBudgetCW > 0 and @POApproval <> 'Y')
+	begin
+		select @error = -1
+		select @error_message += 'Cawangan,'
+		goto EndValidationStep
+	end	
+
+	--budget control by Bahagian
+	;with BGBudgetAmt as 
+	(
+	select T1.U_gc, T1.U_bg, T1.U_budgetAmt
+	FROM [@BUDGET_H] T0 inner join [@BUDGET_D] T1 On T0.Code = T1.Code and T0.U_Active = 'Y' and T0.U_bdgyear = @POYear
+	WHERE ISNULL(T1.U_bg,'') <> ''
+	),
+
+	BGYTDPOAmount as
+	(
+		SELECT M0.AcctCode, M0.PrcName, sum(M0.POAmt) as POAmt
+		FROM
+		(
+			----Previous PO
+			--select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			--from OPOR T0 inner join POR1 T1 ON T0.DocEntry = T1.DocEntry
+			--			inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'BH'
+			--WHERE Year(T0.DocDate) = @POYear and T0.CANCELED = 'N' and T0.DocEntry <> @list_of_cols_val_tab_del
+			--and T1.AcctCode in (select M0.AcctCode from por1 M0 where M0.DocEntry = @list_of_cols_val_tab_del)
+			--AND T1.OcrCode in (select M1.OcrCode from por1 M1 where M1.DocEntry = @list_of_cols_val_tab_del)
+			--group by T1.AcctCode, T4.PrcName
+			--union all
+			----Current PO
+			--select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			--from OPOR T0 inner join POR1 T1 ON T0.DocEntry = T1.DocEntry
+			--			inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'BH'
+			--WHERE Year(T0.DocDate) = @POYear and T0.CANCELED = 'N' and T0.DocEntry = @list_of_cols_val_tab_del
+			--group by T1.AcctCode, T4.PrcName
+			--union all
+			--PO
+			select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from OPOR T0 inner join POR1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'BH'
+			WHERE Year(T0.DocDate) = @POYear and T0.CANCELED = 'N'
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--Previous Manual AP Invoice
+			select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from OPCH T0 inner join PCH1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'BH'
+			WHERE T0.U_ManualInv = 'Y' and Year(T0.DocDate) = @POYear and T0.CANCELED = 'N' and T0.DocEntry <> @list_of_cols_val_tab_del
+			and T1.AcctCode in (select M0.AcctCode from por1 M0 where M0.DocEntry = @list_of_cols_val_tab_del)
+			AND T1.OcrCode in (select M1.OcrCode from por1 M1 where M1.DocEntry = @list_of_cols_val_tab_del)
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--Current Manual AP Invoice
+			select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from OPCH T0 inner join PCH1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'BH'
+			WHERE T0.U_ManualInv = 'Y' and Year(T0.DocDate) = @POYear and T0.CANCELED = 'N' and T0.DocEntry = @list_of_cols_val_tab_del
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--AP Credit Memo from Manual AP Invoice
+			select T1.AcctCode, T4.PrcName , -sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from ORPC T0 inner join RPC1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'BH'
+			WHERE T0.U_ManualInv = 'Y' and Year(T0.DocDate) = @POYear and T0.CANCELED = 'N'
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--Manual AP Credit Memo
+			select T1.AcctCode, T4.PrcName , -sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from ORPC T0 inner join RPC1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'BH'
+			WHERE T0.U_ManualCN = 'Y' and Year(T0.DocDate) = @POYear and T0.CANCELED = 'N'
+			group by T1.AcctCode, T4.PrcName
+		) M0
+		group by M0.AcctCode, M0.PrcName
+	)
+
+	select @CountOverBudgetBG = count(T0.AcctCode)
+	from BGYTDPOAmount T0 LEFT join BGBudgetAmt T1 ON T0.AcctCode = T1.U_gc and T0.PrcName = T1.U_bg
+	WHERE T0.POAmt > ISNULL(T1.U_budgetAmt,0) and ISNULL(T1.U_budgetAmt,0) > 0
+
+	if (@CountOverBudgetBG > 0 and @POApproval <> 'Y')
+	begin
+		select @error = -1
+		select @error_message += 'Bahagian,'
+		goto EndValidationStep
+	end	
+
+	--budget control by Jabatan
+	;with JBBudgetAmt as 
+	(
+	select T1.U_gc, T1.U_jb, T1.U_budgetAmt
+	FROM [@BUDGET_H] T0 inner join [@BUDGET_D] T1 On T0.Code = T1.Code and T0.U_Active = 'Y' and T0.U_bdgyear = @POYear
+	WHERE ISNULL(T1.U_jb,'') <> ''
+	),
+
+	JBYTDPOAmount as
+	(
+		SELECT M0.AcctCode, M0.PrcName, sum(M0.POAmt) as POAmt
+		FROM
+		(
+			----Previous PO
+			--select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			--from OPOR T0 inner join POR1 T1 ON T0.DocEntry = T1.DocEntry
+			--			inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'JB'
+			--WHERE Year(T0.DocDate) = @POYear and T0.CANCELED = 'N' and T0.DocEntry <> @list_of_cols_val_tab_del
+			--and T1.AcctCode in (select M0.AcctCode from por1 M0 where M0.DocEntry = @list_of_cols_val_tab_del)
+			--AND T1.OcrCode in (select M1.OcrCode from por1 M1 where M1.DocEntry = @list_of_cols_val_tab_del)
+			--group by T1.AcctCode, T4.PrcName
+			--union all
+			----Current PO
+			--select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			--from OPOR T0 inner join POR1 T1 ON T0.DocEntry = T1.DocEntry
+			--			inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'JB'
+			--WHERE Year(T0.DocDate) = @POYear and T0.CANCELED = 'N' and T0.DocEntry = @list_of_cols_val_tab_del
+			--group by T1.AcctCode, T4.PrcName
+			--union all
+			--PO
+			select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from OPOR T0 inner join POR1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'JB'
+			WHERE Year(T0.DocDate) = @POYear and T0.CANCELED = 'N'
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--Previous Manual AP Invoice
+			select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from OPCH T0 inner join PCH1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'JB'
+			WHERE T0.U_ManualInv = 'Y' and Year(T0.DocDate) = @POYear and T0.CANCELED = 'N' and T0.DocEntry <> @list_of_cols_val_tab_del
+			and T1.AcctCode in (select M0.AcctCode from por1 M0 where M0.DocEntry = @list_of_cols_val_tab_del)
+			AND T1.OcrCode in (select M1.OcrCode from por1 M1 where M1.DocEntry = @list_of_cols_val_tab_del)
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--Current Manual AP Invoice
+			select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from OPCH T0 inner join PCH1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'JB'
+			WHERE T0.U_ManualInv = 'Y' and Year(T0.DocDate) = @POYear and T0.CANCELED = 'N' and T0.DocEntry = @list_of_cols_val_tab_del
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--AP Credit Memo from Manual AP Invoice
+			select T1.AcctCode, T4.PrcName , -sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from ORPC T0 inner join RPC1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'JB'
+			WHERE T0.U_ManualInv = 'Y' and Year(T0.DocDate) = @POYear and T0.CANCELED = 'N'
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--Manual AP Credit Memo
+			select T1.AcctCode, T4.PrcName , -sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from ORPC T0 inner join RPC1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'JB'
+			WHERE T0.U_ManualCN = 'Y' and Year(T0.DocDate) = @POYear and T0.CANCELED = 'N'
+			group by T1.AcctCode, T4.PrcName
+		) M0
+		group by M0.AcctCode, M0.PrcName
+	)
+
+	select @CountOverBudgetJB = count(T0.AcctCode)
+	from JBYTDPOAmount T0 LEFT join JBBudgetAmt T1 ON T0.AcctCode = T1.U_gc and T0.PrcName = T1.U_jb
+	WHERE T0.POAmt > ISNULL(T1.U_budgetAmt,0) and ISNULL(T1.U_budgetAmt,0) > 0
+
+	if (@CountOverBudgetJB > 0 and @POApproval <> 'Y')
+	begin
+		select @error = -1
+		select @error_message += 'Jabatan,'
+		goto EndValidationStep
+	end	
+
+	--budget control by Unit
+	;with UNBudgetAmt as 
+	(
+	select T1.U_gc, T1.U_unit, T1.U_budgetAmt
+	FROM [@BUDGET_H] T0 inner join [@BUDGET_D] T1 On T0.Code = T1.Code and T0.U_Active = 'Y' and T0.U_bdgyear = @POYear
+	WHERE ISNULL(T1.U_unit,'') <> ''
+	),
+
+	UNYTDPOAmount as
+	(
+		SELECT M0.AcctCode, M0.PrcName, sum(M0.POAmt) as POAmt
+		FROM
+		(
+			----Previous PO
+			--select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			--from OPOR T0 inner join POR1 T1 ON T0.DocEntry = T1.DocEntry
+			--			inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'UN'
+			--WHERE Year(T0.DocDate) = @POYear and T0.CANCELED = 'N' and T0.DocEntry <> @list_of_cols_val_tab_del
+			--and T1.AcctCode in (select M0.AcctCode from por1 M0 where M0.DocEntry = @list_of_cols_val_tab_del)
+			--AND T1.OcrCode in (select M1.OcrCode from por1 M1 where M1.DocEntry = @list_of_cols_val_tab_del)
+			--group by T1.AcctCode, T4.PrcName
+			--union all
+			----Current PO
+			--select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			--from OPOR T0 inner join POR1 T1 ON T0.DocEntry = T1.DocEntry
+			--			inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'UN'
+			--WHERE Year(T0.DocDate) = @POYear and T0.CANCELED = 'N' and T0.DocEntry = @list_of_cols_val_tab_del
+			--group by T1.AcctCode, T4.PrcName
+			--union all
+			--PO
+			select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from OPOR T0 inner join POR1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'UN'
+			WHERE Year(T0.DocDate) = @POYear and T0.CANCELED = 'N'
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--Previous Manual AP Invoice
+			select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from OPCH T0 inner join PCH1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'UN'
+			WHERE T0.U_ManualInv = 'Y' and Year(T0.DocDate) = @POYear and T0.CANCELED = 'N' and T0.DocEntry <> @list_of_cols_val_tab_del
+			and T1.AcctCode in (select M0.AcctCode from por1 M0 where M0.DocEntry = @list_of_cols_val_tab_del)
+			AND T1.OcrCode in (select M1.OcrCode from por1 M1 where M1.DocEntry = @list_of_cols_val_tab_del)
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--Current Manual AP Invoice
+			select T1.AcctCode, T4.PrcName ,sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from OPCH T0 inner join PCH1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'UN'
+			WHERE T0.U_ManualInv = 'Y' and Year(T0.DocDate) = @POYear and T0.CANCELED = 'N' and T0.DocEntry = @list_of_cols_val_tab_del
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--AP Credit Memo from Manual AP Invoice
+			select T1.AcctCode, T4.PrcName , -sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from ORPC T0 inner join RPC1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'UN'
+			WHERE T0.U_ManualInv = 'Y' and Year(T0.DocDate) = @POYear and T0.CANCELED = 'N'
+			group by T1.AcctCode, T4.PrcName
+			union all
+			--Manual AP Credit Memo
+			select T1.AcctCode, T4.PrcName , -sum(T1.LineTotal * ((100 - ISNULL(T0.DiscPrcnt,0)) / 100)) as POAmt
+			from ORPC T0 inner join RPC1 T1 ON T0.DocEntry = T1.DocEntry
+						inner join OPRC T4 ON T1.OcrCode = T4.PrcCode and T4.GrpCode = 'UN'
+			WHERE T0.U_ManualCN = 'Y' and Year(T0.DocDate) = @POYear and T0.CANCELED = 'N'
+			group by T1.AcctCode, T4.PrcName
+		) M0
+		group by M0.AcctCode, M0.PrcName
+	)
+
+	select @CountOverBudgetWL = count(T0.AcctCode)
+	from UNYTDPOAmount T0 LEFT join UNBudgetAmt T1 ON T0.AcctCode = T1.U_gc and T0.PrcName = T1.U_unit
+	WHERE T0.POAmt > ISNULL(T1.U_budgetAmt,0) and ISNULL(T1.U_budgetAmt,0) > 0
+
+	if (@CountOverBudgetWL > 0 and @POApproval <> 'Y')
+	begin
+		select @error = -1
+		select @error_message += 'Unit.'
+		goto EndValidationStep
+	end	
+
+	select @error_message = case when right(@error_message, 1) = ',' then concat(SUBSTRING(@error_message,0, len(@error_message)),'.') else @error_message end
+	--select @error = convert(int, @list_of_cols_val_tab_del)
+	if @error <> 0
+	begin
+		update OPCH set U_OverBudget = 'Y'
+		where DocEntry = @list_of_cols_val_tab_del
+	end
+
+	EndValidationStep:
+	select @error, @error_message
+
+end
+
