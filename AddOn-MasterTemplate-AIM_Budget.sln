@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 16
 VisualStudioVersion = 16.0.29311.281
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Add-On", "Add-On.csproj", "{9214DFA4-E4BE-4409-9D6B-96DD4C145794}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AIM-Budget-Add-On", "AIM-Budget-Add-On.csproj", "{9214DFA4-E4BE-4409-9D6B-96DD4C145794}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
